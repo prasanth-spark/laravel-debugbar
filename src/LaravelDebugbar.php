@@ -18,8 +18,7 @@ use Barryvdh\Debugbar\DataCollector\ViewCollector;
 use Barryvdh\Debugbar\Storage\SocketStorage;
 use Barryvdh\Debugbar\Storage\FilesystemStorage;
 use DebugBar\Bridge\MonologCollector;
-use DebugBar\Bridge\SwiftMailer\SwiftLogCollector;
-use DebugBar\Bridge\SwiftMailer\SwiftMailCollector;
+use DebugBar\Bridge\Symfony\SymfonyMailCollector;
 use DebugBar\DataCollector\ConfigCollector;
 use DebugBar\DataCollector\DataCollectorInterface;
 use DebugBar\DataCollector\ExceptionsCollector;
@@ -34,11 +33,17 @@ use DebugBar\DebugBar;
 use DebugBar\Storage\PdoStorage;
 use DebugBar\Storage\RedisStorage;
 use Exception;
+use Throwable;
 use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Mail\Events\MessageSent;
 use Illuminate\Session\SessionManager;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Mailer\Envelope;
+use Symfony\Component\Mailer\SentMessage;
+use Symfony\Component\Mailer\Transport\AbstractTransport;
+use Symfony\Component\Mime\RawMessage;
 
 /**
  * Debug bar subclass which adds all without Request and with LaravelCollector.
@@ -102,6 +107,9 @@ class LaravelDebugbar extends DebugBar
         $this->app = $app;
         $this->version = $app->version();
         $this->is_lumen = Str::contains($this->version, 'Lumen');
+        if ($this->is_lumen) {
+            $this->version = Str::betweenFirst($app->version(), '(', ')');
+        }
     }
 
     /**
@@ -204,7 +212,8 @@ class LaravelDebugbar extends DebugBar
         if ($this->shouldCollect('views', true) && isset($this->app['events'])) {
             try {
                 $collectData = $this->app['config']->get('debugbar.options.views.data', true);
-                $this->addCollector(new ViewCollector($collectData));
+                $excludePaths = $this->app['config']->get('debugbar.options.views.exclude_paths', []);
+                $this->addCollector(new ViewCollector($collectData, $excludePaths));
                 $this->app['events']->listen(
                     'composing:*',
                     function ($view, $data = []) use ($debugbar) {
@@ -258,7 +267,7 @@ class LaravelDebugbar extends DebugBar
                             try {
                                 $logMessage = (string) $message;
                                 if (mb_check_encoding($logMessage, 'UTF-8')) {
-                                    $logMessage .= (!empty($context) ? ' ' . json_encode($context) : '');
+                                    $logMessage .= (!empty($context) ? ' ' . json_encode($context, JSON_PRETTY_PRINT) : '');
                                 } else {
                                     $logMessage = "[INVALID UTF-8 DATA]";
                                 }
@@ -335,30 +344,15 @@ class LaravelDebugbar extends DebugBar
 
             try {
                 $db->listen(
-                    function (
-                        $query,
-                        $bindings = null,
-                        $time = null,
-                        $connectionName = null
-                    ) use (
-                        $db,
-                        $queryCollector
-                    ) {
+                    function (\Illuminate\Database\Events\QueryExecuted $query) use ($db, $queryCollector) {
                         if (!app(static::class)->shouldCollect('db', true)) {
                             return; // Issue 776 : We've turned off collecting after the listener was attached
                         }
-                        // Laravel 5.2 changed the way some core events worked. We must account for
-                        // the first argument being an "event object", where arguments are passed
-                        // via object properties, instead of individual arguments.
-                        if ($query instanceof \Illuminate\Database\Events\QueryExecuted) {
-                            $bindings = $query->bindings;
-                            $time = $query->time;
-                            $connection = $query->connection;
-
-                            $query = $query->sql;
-                        } else {
-                            $connection = $db->connection($connectionName);
-                        }
+                        
+                        $bindings = $query->bindings;
+                        $time = $query->time;
+                        $connection = $query->connection;
+                        $query = $query->sql;
 
                         //allow collecting only queries slower than a specified amount of milliseconds
                         $threshold = app('config')->get('debugbar.options.db.slow_threshold', false);
@@ -450,16 +444,42 @@ class LaravelDebugbar extends DebugBar
             }
         }
 
-        if ($this->shouldCollect('mail', true) && class_exists('Illuminate\Mail\MailServiceProvider') && $this->checkVersion('9.0', '<')) {
+        if ($this->shouldCollect('mail', true) && class_exists('Illuminate\Mail\MailServiceProvider') && isset($this->app['events'])) {
             try {
-                $mailer = $this->app['mailer']->getSwiftMailer();
-                $this->addCollector(new SwiftMailCollector($mailer));
-                if (
-                    $this->app['config']->get('debugbar.options.mail.full_log') && $this->hasCollector(
-                        'messages'
-                    )
-                ) {
-                    $this['messages']->aggregate(new SwiftLogCollector($mailer));
+                $mailCollector = new SymfonyMailCollector();
+                $this->addCollector($mailCollector);
+                $this->app['events']->listen(function (MessageSent $event) use ($mailCollector) {
+                    $mailCollector->addSymfonyMessage($event->sent->getSymfonySentMessage());
+                });
+
+                if ($this->app['config']->get('debugbar.options.mail.full_log')) {
+                    $mailCollector->showMessageDetail();
+                }
+
+                if ($debugbar->hasCollector('time') && $this->app['config']->get('debugbar.options.mail.timeline')) {
+                    $transport = $this->app['mailer']->getSymfonyTransport();
+                    $this->app['mailer']->setSymfonyTransport(new class($transport, $this) extends AbstractTransport{
+                        private $originalTransport;
+                        private $laravelDebugbar;
+
+                        public function __construct($transport, $laravelDebugbar)
+                        {
+                            $this->originalTransport = $transport;
+                            $this->laravelDebugbar = $laravelDebugbar;
+                        }
+                        public function send(RawMessage $message, Envelope $envelope = null): ?SentMessage
+                        {
+                            return $this->laravelDebugbar['time']->measure(
+                                'mail: '. Str::limit($message->getSubject(), 100),
+                                function () use ($message, $envelope) {
+                                    return $this->originalTransport->send($message, $envelope);
+                                },
+                                'mail'
+                            );
+                        }
+                        protected function doSend(SentMessage $message): void {}
+                        public function __toString(): string{ $this->originalTransport->__toString(); }
+                    });
                 }
             } catch (\Exception $e) {
                 $this->addThrowable(
@@ -635,7 +655,7 @@ class LaravelDebugbar extends DebugBar
     /**
      * Adds an exception to be profiled in the debug bar
      *
-     * @param Exception $e
+     * @param Throwable $e
      */
     public function addThrowable($e)
     {
@@ -833,7 +853,7 @@ class LaravelDebugbar extends DebugBar
     protected function isJsonRequest(Request $request)
     {
         // If XmlHttpRequest or Live, return true
-        if ($request->isXmlHttpRequest() || $request->headers->get('X-Livewire')) {
+        if ($request->isXmlHttpRequest() || $request->headers->has('X-Livewire')) {
             return true;
         }
 
@@ -892,9 +912,12 @@ class LaravelDebugbar extends DebugBar
      */
     public function injectDebugbar(Response $response)
     {
+        $config = $this->app['config'];
         $content = $response->getContent();
 
         $renderer = $this->getJavascriptRenderer();
+        $autoShow = $config->get('debugbar.ajax_handler_auto_show', true);
+        $renderer->setAjaxHandlerAutoShow($autoShow);
         if ($this->getStorage()) {
             $openHandlerUrl = route('debugbar.openhandler');
             $renderer->setOpenHandlerUrl($openHandlerUrl);

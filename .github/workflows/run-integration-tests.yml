@@ -18,19 +18,15 @@ jobs:
             COMPOSER_NO_INTERACTION: 1
         strategy:
             matrix:
-                php: [8.0, 7.4, 7.3, 7.2]
-                lumen: [8.*, 7.*, 6.*]
+                php: [8.2, 8.1, 8.0]
+                lumen: [9.*]
                 exclude:
-                  - lumen: 8.*
-                    php: 7.2
-                  - lumen: 7.*
-                    php: 8.0
-                  - lumen: 6.*
+                  - lumen: 10.*
                     php: 8.0
         name: P${{ matrix.php }} - Lumen${{ matrix.lumen }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@v2
+              uses: actions/checkout@v3
               with:
                   path: src
 
@@ -43,8 +39,9 @@ jobs:
 
             - name: Install dependencies
               run: |
-                  composer create-project --prefer-dist laravel/lumen:${{ matrix.lumen }} --no-progress sample
+                  composer create-project --prefer-dist laravel/lumen:${{ matrix.lumen }} --stability=dev --no-progress sample
                   cd sample
+                  composer config minimum-stability dev
                   composer update  --prefer-stable --prefer-dist --no-progress
             - name: Add package from source
               run: |
@@ -68,15 +65,15 @@ jobs:
             COMPOSER_NO_INTERACTION: 1
         strategy:
             matrix:
-                php: [8.0, 7.4, 7.3, 7.2]
-                laravel: [8.*, 7.*, 6.*]
+                php: [8.2, 8.1, 8.0]
+                laravel: [10.*, 9.*]
                 exclude:
-                  - laravel: 8.*
-                    php: 7.2
+                  - laravel: 10.*
+                    php: 8.0
         name: P${{ matrix.php }} - Laravel${{ matrix.laravel }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@v2
+              uses: actions/checkout@v3
               with:
                   path: src
 
@@ -89,8 +86,9 @@ jobs:
 
             - name: Install dependencies
               run: |
-                  composer create-project --prefer-dist laravel/laravel:${{ matrix.laravel }} --no-progress sample
+                  composer create-project --prefer-dist laravel/laravel:${{ matrix.laravel }} --stability=dev --no-progress sample
                   cd sample
+                  composer config minimum-stability dev
                   composer update --prefer-stable --prefer-dist --no-progress
             - name: Add package from source
               run: |
